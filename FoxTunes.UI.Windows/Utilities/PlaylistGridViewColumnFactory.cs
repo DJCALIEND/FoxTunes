@@ -7,32 +7,27 @@ using System.Linq;
 
 namespace FoxTunes
 {
-    public class PlaylistGridViewColumnFactory : IDisposable
+    [ComponentDependency(Slot = ComponentSlots.UserInterface)]
+    public class PlaylistGridViewColumnFactory : StandardComponent, IDisposable
     {
-        protected static ILogger Logger
-        {
-            get
-            {
-                return LogManager.Logger;
-            }
-        }
-
-        public static PlaylistColumnProviderManager PlaylistColumnProviderManager = ComponentRegistry.Instance.GetComponent<PlaylistColumnProviderManager>();
-
-        public PlaylistGridViewColumnFactory(IScriptingRuntime scriptingRuntime)
-        {
-            this.ScriptingRuntime = scriptingRuntime;
-        }
-
-        public bool Suspended { get; private set; }
+        public PlaylistColumnProviderManager PlaylistColumnProviderManager { get; private set; }
 
         public IScriptingRuntime ScriptingRuntime { get; private set; }
 
-        public IScriptingContext ScriptingContext { get; private set; }
+        public Lazy<IScriptingContext> ScriptingContext { get; private set; }
+
+        public bool Suspended { get; private set; }
+
+        public override void InitializeComponent(ICore core)
+        {
+            this.PlaylistColumnProviderManager = ComponentRegistry.Instance.GetComponent<PlaylistColumnProviderManager>();
+            this.ScriptingRuntime = core.Components.ScriptingRuntime;
+            this.ScriptingContext = new Lazy<IScriptingContext>(this.ScriptingRuntime.CreateContext);
+            base.InitializeComponent(core);
+        }
 
         public PlaylistGridViewColumn Create(PlaylistColumn column)
         {
-            this.EnsureScriptingContext();
             var gridViewColumn = new PlaylistGridViewColumn(column);
             switch (column.Type)
             {
@@ -41,7 +36,7 @@ namespace FoxTunes
                     {
                         gridViewColumn.DisplayMemberBinding = new PlaylistScriptBinding()
                         {
-                            ScriptingContext = this.ScriptingContext,
+                            ScriptingContext = this.ScriptingContext.Value,
                             Script = column.Script
                         };
                     }
@@ -54,6 +49,16 @@ namespace FoxTunes
                         {
                             gridViewColumn.CellTemplate = provider.CellTemplate;
                         }
+                    }
+                    break;
+                case PlaylistColumnType.Tag:
+                    if (!string.IsNullOrEmpty(column.Tag))
+                    {
+                        gridViewColumn.DisplayMemberBinding = new PlaylistMetaDataBinding()
+                        {
+                            Name = column.Tag,
+                            Format = column.Format
+                        };
                     }
                     break;
             }
@@ -125,7 +130,7 @@ namespace FoxTunes
             return true;
         }
 
-        public void Resize(PlaylistGridViewColumn column)
+        public void Resize(GridViewColumn column)
         {
             this.Suspended = true;
             try
@@ -140,15 +145,6 @@ namespace FoxTunes
             {
                 this.Suspended = false;
             }
-        }
-
-        protected virtual void EnsureScriptingContext()
-        {
-            if (this.ScriptingContext != null)
-            {
-                return;
-            }
-            this.ScriptingContext = this.ScriptingRuntime.CreateContext();
         }
 
         public bool IsDisposed { get; private set; }
@@ -171,9 +167,9 @@ namespace FoxTunes
 
         protected virtual void OnDisposing()
         {
-            if (this.ScriptingContext != null)
+            if (this.ScriptingContext != null && this.ScriptingContext.IsValueCreated)
             {
-                this.ScriptingContext.Dispose();
+                this.ScriptingContext.Value.Dispose();
             }
         }
 

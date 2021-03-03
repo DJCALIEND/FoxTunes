@@ -9,6 +9,7 @@ using System.Collections.ObjectModel;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Input;
 
 namespace FoxTunes.ViewModel
@@ -17,7 +18,9 @@ namespace FoxTunes.ViewModel
     {
         public Playlist CurrentPlaylist { get; private set; }
 
-        public PlaylistColumn SortColumn { get; private set; }
+        public PlaylistSortingBehaviour PlaylistSortingBehaviour { get; private set; }
+
+        public PlaylistGridViewColumnFactory GridViewColumnFactory { get; private set; }
 
         public IFileActionHandlerManager FileActionHandlerManager { get; private set; }
 
@@ -74,34 +77,6 @@ namespace FoxTunes.ViewModel
         }
 
         public event EventHandler GroupingScriptChanged;
-
-        private bool _SortingEnabled { get; set; }
-
-        public bool SortingEnabled
-        {
-            get
-            {
-                return this._SortingEnabled;
-            }
-            set
-            {
-                this._SortingEnabled = value;
-                this.OnSortingEnabledChanged();
-            }
-        }
-
-        protected virtual void OnSortingEnabledChanged()
-        {
-            if (this.SortingEnabledChanged != null)
-            {
-                this.SortingEnabledChanged(this, EventArgs.Empty);
-            }
-            this.OnPropertyChanged("SortingEnabled");
-        }
-
-        public event EventHandler SortingEnabledChanged;
-
-        public PlaylistGridViewColumnFactory GridViewColumnFactory { get; private set; }
 
         public IList SelectedItems
         {
@@ -216,9 +191,8 @@ namespace FoxTunes.ViewModel
         {
             base.InitializeComponent(core);
             this.PlaylistManager.SelectedItemsChanged += this.OnSelectedItemsChanged;
-            this.GridViewColumnFactory = new PlaylistGridViewColumnFactory(this.ScriptingRuntime);
-            this.GridViewColumnFactory.PositionChanged += this.OnColumnChanged;
-            this.GridViewColumnFactory.WidthChanged += this.OnColumnChanged;
+            this.PlaylistSortingBehaviour = ComponentRegistry.Instance.GetComponent<PlaylistSortingBehaviour>();
+            this.GridViewColumnFactory = ComponentRegistry.Instance.GetComponent<PlaylistGridViewColumnFactory>();
             this.FileActionHandlerManager = core.Managers.FileActionHandler;
             this.Configuration = core.Components.Configuration;
 #if NET40
@@ -233,31 +207,11 @@ namespace FoxTunes.ViewModel
                 PlaylistGroupingBehaviourConfiguration.GROUP_SCRIPT_ELEMENT
             ).ConnectValue(value => this.GroupingScript = value);
 #endif
-            this.Configuration.GetElement<BooleanConfigurationElement>(
-                PlaylistBehaviourConfiguration.SECTION,
-                PlaylistBehaviourConfiguration.SORT_ENABLED_ELEMENT
-            ).ConnectValue(value => this.SortingEnabled = value);
         }
 
         protected virtual void OnSelectedItemsChanged(object sender, EventArgs e)
         {
             var task = Windows.Invoke(this.OnSelectedItemsChanged);
-        }
-
-        protected virtual void OnColumnChanged(object sender, PlaylistColumn e)
-        {
-            if (this.DatabaseFactory != null)
-            {
-                using (var database = this.DatabaseFactory.Create())
-                {
-                    using (var transaction = database.BeginTransaction(database.PreferredIsolationLevel))
-                    {
-                        var set = database.Set<PlaylistColumn>(transaction);
-                        set.AddOrUpdate(e);
-                        transaction.Commit();
-                    }
-                }
-            }
         }
 
         protected override async Task OnSignal(object sender, ISignal signal)
@@ -281,7 +235,15 @@ namespace FoxTunes.ViewModel
                     }
                     break;
                 case CommonSignals.PlaylistColumnsUpdated:
-                    await this.ReloadColumns().ConfigureAwait(false);
+                    var columns = signal.State as IEnumerable<PlaylistColumn>;
+                    if (columns != null && columns.Any())
+                    {
+                        await this.RefreshColumns().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await this.ReloadColumns().ConfigureAwait(false);
+                    }
                     break;
                 case CommonSignals.MetaDataUpdated:
                     var names = signal.State as IEnumerable<string>;
@@ -516,23 +478,14 @@ namespace FoxTunes.ViewModel
 
         protected virtual IEnumerable<PlaylistGridViewColumn> GetGridColumns()
         {
-            if (this.DatabaseFactory != null && this.GridViewColumnFactory != null)
+            if (this.PlaylistBrowser != null)
             {
-                using (var database = this.DatabaseFactory.Create())
-                {
-                    using (var transaction = database.BeginTransaction(database.PreferredIsolationLevel))
-                    {
-                        var set = database.Set<PlaylistColumn>(transaction);
-                        set.Fetch.Filter.AddColumn(
-                            set.Table.GetColumn(ColumnConfig.By("Enabled", ColumnFlags.None))
-                        ).With(filter => filter.Right = filter.CreateConstant(1));
-                        foreach (var column in set)
-                        {
-                            yield return this.GridViewColumnFactory.Create(column);
-                        }
-                    }
-                }
+                return this.PlaylistBrowser.GetColumns()
+                    .Where(column => column.Enabled)
+                    .Select(column => this.GridViewColumnFactory.Create(column))
+                    .ToArray();
             }
+            return new PlaylistGridViewColumn[] { };
         }
 
         public virtual async Task Refresh()
@@ -588,47 +541,42 @@ namespace FoxTunes.ViewModel
             }
         }
 
-        protected virtual Task ResizeColumn(PlaylistGridViewColumn column)
+        protected virtual Task ResizeColumn(GridViewColumn column)
         {
             return Windows.Invoke(() => this.GridViewColumnFactory.Resize(column));
         }
 
+        protected virtual Task RefreshColumns()
+        {
+            if (this.GridColumns != null)
+            {
+                var count = this.PlaylistBrowser.GetColumns()
+                    .Where(column => column.Enabled)
+                    .Count();
+                if (this.GridColumns.Count == count)
+                {
+                    //Nothing to do, we only handle add/remove columns.
+#if NET40
+                    return TaskEx.FromResult(false);
+#else
+                    return Task.CompletedTask;
+#endif
+                }
+            }
+            return this.ReloadColumns();
+        }
+
         protected virtual Task ReloadColumns()
         {
-            var columns = this.GetGridColumns();
-            return Windows.Invoke(() => this.GridColumns = new ObservableCollection<PlaylistGridViewColumn>(columns));
+            return Windows.Invoke(
+                () => this.GridColumns = new ObservableCollection<PlaylistGridViewColumn>(this.GetGridColumns())
+            );
         }
 
         public async Task Sort(PlaylistColumn playlistColumn)
         {
-            if (!this.SortingEnabled)
-            {
-                Logger.Write(this, LogLevel.Warn, "Sorting is disabled.");
-                return;
-            }
             var playlist = await this.GetPlaylist().ConfigureAwait(false);
-            var descending = default(bool);
-            if (object.ReferenceEquals(this.SortColumn, playlistColumn))
-            {
-                this.SortColumn = null;
-                descending = true;
-            }
-            else
-            {
-                this.SortColumn = playlistColumn;
-            }
-            await this.PlaylistManager.Sort(playlist, playlistColumn, descending).ConfigureAwait(false);
-        }
-
-        protected override void OnDisposing()
-        {
-            if (this.GridViewColumnFactory != null)
-            {
-                this.GridViewColumnFactory.PositionChanged -= this.OnColumnChanged;
-                this.GridViewColumnFactory.WidthChanged -= this.OnColumnChanged;
-                this.GridViewColumnFactory.Dispose();
-            }
-            base.OnDisposing();
+            await this.PlaylistSortingBehaviour.Sort(playlist, playlistColumn).ConfigureAwait(false);
         }
     }
 }
